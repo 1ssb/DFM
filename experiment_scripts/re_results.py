@@ -1,10 +1,12 @@
-import sys
-import os
-import wandb
+import sys, os, re, shutil
+from datetime import datetime
+import wandb 
 import hydra
+import cProfile, GPUtil, time
 from omegaconf import DictConfig
+import torchvision.transforms as transforms
 from torch.utils.data import Dataset, DataLoader
-
+from saver import asset_saver, dict_writer, prepare_video_viz
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from denoising_diffusion_pytorch.denoising_diffusion_pytorch import (
     GaussianDiffusion,
@@ -12,8 +14,6 @@ from denoising_diffusion_pytorch.denoising_diffusion_pytorch import (
 )
 import data_io
 from einops import rearrange
-
-# from PixelNeRF import PixelNeRFModel, PixelNeRFImageModel
 from PixelNeRF import PixelNeRFModelCond
 import torch
 import imageio
@@ -26,12 +26,87 @@ from results_configs import re_indices
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 from PIL import Image
+import json, tqdm
+from pathlib import Path
+# from boxes import detector
+# from upscaler import upscaler
+# from observer import observer
 
+##### My helper functions #####
+def mover(render_number):
+    base_dir = "/home/projects/Rudra_Generative_Robotics/EK/DFM/results/"
+    
+    # Generate timestamp
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    render_dir = os.path.join(base_dir, f"sample_{render_number}_{timestamp}")
+    
+    # Subdirectories for images, depth maps, and videos
+    images_dir = os.path.join(render_dir, "images")
+    depth_maps_dir = os.path.join(render_dir, "depth_images")
+    videos_dir = os.path.join(render_dir, "videos")
+
+    # Regular expression patterns to match files
+    pattern1 = re.compile(r"frame_\d{4}\.png")
+    pattern2 = re.compile(r"frame_depth_\d{4}\.png")
+
+    # Create directories if they don't exist
+    for directory in [images_dir, depth_maps_dir, videos_dir]:
+        os.makedirs(directory, exist_ok=True)
+
+    for file_name in os.listdir(base_dir):
+        from_path = os.path.join(base_dir, file_name)
+
+        if pattern1.match(file_name):
+            to_path = os.path.join(images_dir, file_name)
+        elif pattern2.match(file_name):
+            to_path = os.path.join(depth_maps_dir, file_name)
+        elif file_name in ["video.mp4", "depth_video.mp4"]:
+            to_path = os.path.join(videos_dir, file_name)
+        else:
+            continue
+
+        try:
+            shutil.move(from_path, to_path)
+        except Exception as e:
+            print(f"Error moving file {file_name}: {e}")
+
+    print("Results moved to timestamped subdirectory successfully!")
+
+def save_rgbd(rgbd_list, render_number, base_dir='./RGBD/strafe-right'):
+    items = 50
+    if not isinstance(rgbd_list, list) or len(rgbd_list) != items:
+        raise ValueError(f"rgbd_list must be a list of {items} items.")
+
+    # Generate a timestamp
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    save_dir = os.path.join(base_dir, f"sample_{render_number}_{timestamp}")
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    for idx, rgbd in enumerate(rgbd_list, start=1):
+        # Check if the item is a PyTorch tensor, convert it to a NumPy array
+        if isinstance(rgbd, torch.Tensor):
+            rgbd = rgbd.detach().cpu().numpy()
+        elif not isinstance(rgbd, np.ndarray):
+            raise TypeError(f"Item at index {idx} is neither a NumPy array nor a PyTorch tensor.")
+
+        # Save the NumPy array as an .npy file
+        file_path = os.path.join(save_dir, f"{idx}.npy")
+        np.save(file_path, rgbd)
+
+    print(f"All RGB-D assets have been saved in {save_dir}.")
+
+
+##### DFM Code ######
 
 @hydra.main(
     version_base=None, config_path="../configurations/", config_name="config",
 )
 def train(cfg: DictConfig):
+    # os.system("echo 'Initial CPU and Memory usage:'")
+    # os.system("top -b -n1 | head -n 10")
+    # os.system("echo 'Initial GPU usage:'")
+    # os.system("nvidia-smi")
     run = wandb.init(**cfg.wandb)
     wandb.run.log_code(".")
     wandb.run.name = cfg.name
@@ -42,11 +117,12 @@ def train(cfg: DictConfig):
     # initialize the accelerator at the beginning
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
-        split_batches=True, mixed_precision="no", kwargs_handlers=[ddp_kwargs],
+        split_batches=True, mixed_precision="no", kwargs_handlers=[ddp_kwargs]
     )
-
+    
     # dataset
     train_batch_size = cfg.batch_size
+    start_time = time.time()
     dataset = data_io.get_dataset(cfg)
     dl = DataLoader(
         dataset,
@@ -55,9 +131,11 @@ def train(cfg: DictConfig):
         pin_memory=True,
         num_workers=0,
     )
+    data_loading_time = time.time() - start_time
+    # print(f"Data loading time: {data_loading_time} seconds")
     torch.manual_seed(0)
     # torch.manual_seed(500)
-
+    
     # model = PixelNeRFModel(near=1.2, far=4.0, dim=64, dim_mults=(1, 1, 2, 4)).cuda()
     render_settings = {
         "n_coarse": 64,
@@ -126,18 +204,18 @@ def train(cfg: DictConfig):
     )
     sampling_type = cfg.sampling_type
     use_dataset_pose = True
-    render_orig_traj = True
-    nsamples = 2
-
+    render_orig_traj = False
+    # nsamples = 1
+    
     if sampling_type == "simple":
-        nsamples = 50
+        all_times= 0
         with torch.no_grad():
             for _ in range(1):
                 step = 150
                 for i in re_indices.interesting_indices:
-                    print(f"Starting rendering step {i}")
+                    #print(f"Starting rendering step {i}")
                     video_idx = i[0]
-
+                    
                     start_idx = 0
                     end_idx = start_idx + step
 
@@ -151,409 +229,96 @@ def train(cfg: DictConfig):
                     ctxt_idx_np = np.array(ctxt_idx, dtype=np.int64)
                     trgt_idx_np = np.array(trgt_idx, dtype=np.int64)
 
-                    print(f"Starting rendering step {ctxt_idx_np}, {trgt_idx_np}")
+                    #print(f"Starting rendering step {ctxt_idx_np}, {trgt_idx_np}")
                     data = dataset.data_for_video(
                         video_idx=video_idx, ctxt_idx=ctxt_idx_np, trgt_idx=trgt_idx_np,
                     )
                     inp = to_gpu(data[0], "cuda")
                     for k in inp.keys():
                         inp[k] = inp[k].unsqueeze(0)
-                    inp["num_frames_render"] = 30
+                    inp["num_frames_render"] = 50
 
                     if not use_dataset_pose:
                         poses = trainer.model.model.compute_poses(
-                            "interpolation", inp, 5, max_angle=30
+                            "interpolation", inp, 5, max_angle=15
                         )
-                        print(f"poses shape: {poses.shape}")
+                        #print(f"poses shape: {poses.shape}")
                         inp["render_poses"] = poses
                         inp["trgt_c2w"] = poses[-1].unsqueeze(0).unsqueeze(0).cuda()
 
-                    if not render_orig_traj:
-                        del inp["render_poses"]
-                    print(f"len of idx: {len(ctxt_idx)}")
-                    for j in range(nsamples):
-                        print(f"Starting sample {j}")
-                        out = trainer.ema.ema_model.sample(batch_size=1, inp=inp)
-                        (
-                            frames,
-                            depth_frames,
-                            conditioning_depth_img,
-                        ) = prepare_video_viz(out)
-
-                        # save to disk
-                        folder = os.path.join(run_dir, f"videos_{video_idx}_{j}")
-                        os.makedirs(
-                            folder, exist_ok=True,
-                        )
-                        print(f"saving, len(frames): {len(frames)}")
-                        for frame_idx, frame in enumerate(frames):
-                            Image.fromarray(frame).save(
-                                os.path.join(folder, f"frame_{frame_idx:04d}.png",)
-                            )
-                        for frame_idx, frame in enumerate(depth_frames):
-                            Image.fromarray(frame).save(
-                                os.path.join(
-                                    folder, f"frame_depth_{frame_idx:04d}.png",
-                                )
-                            )
-
-                        denoised_f = os.path.join(run_dir, "denoised_view_circle.mp4")
-                        imageio.mimwrite(denoised_f, frames, fps=10, quality=10)
-                        denoised_f_depth = os.path.join(
-                            run_dir, "denoised_view_circle_depth.mp4"
-                        )
-                        imageio.mimwrite(
-                            denoised_f_depth, depth_frames, fps=10, quality=10
-                        )
-                        wandb.log(
-                            {
-                                "vid/interp": wandb.Video(
-                                    denoised_f,
-                                    format="mp4",
-                                    fps=10,
-                                    caption=f"video {i}",
-                                ),
-                                "vid/interp_depth": wandb.Video(
-                                    denoised_f_depth, format="mp4", fps=10
-                                ),
-                            }
-                        )
-                        ctxt_img = (
-                            trainer.model.unnormalize(inp["ctxt_rgb"][:, 0])
-                            .cpu()
-                            .detach()
-                        )
-                        ctxt_img = torch.clip(ctxt_img, 0, 1)
-                        trgt_img = (
-                            trainer.model.unnormalize(inp["trgt_rgb"][:, 0])
-                            .cpu()
-                            .detach()
-                        )
-                        trgt_img = torch.clip(trgt_img, 0, 1)
-                        image_dict = {
-                            "result/trgt_rgb": wandb.Image(
-                                make_grid(trgt_img).permute(1, 2, 0).numpy()
-                            ),
-                            "result/ctxt_rgb": wandb.Image(
-                                make_grid(ctxt_img).permute(1, 2, 0).numpy()
-                            ),
-                            "result/input_render": wandb.Image(
-                                make_grid(out["rgb"].cpu().detach())
-                                .permute(1, 2, 0)
-                                .numpy()
-                            ),
-                            "result/output": wandb.Image(
-                                make_grid(
-                                    trainer.model.normalize(out["images"])
-                                    .cpu()
-                                    .detach()
-                                )
-                                .permute(1, 2, 0)
-                                .numpy()
-                            ),
-                            "result/input_depth": wandb.Image(
-                                make_grid(conditioning_depth_img)
-                                .permute(1, 2, 0)
-                                .numpy()
-                            ),
-                        }
-
-                        fig = plt.figure()
-                        ax = fig.add_subplot(111, projection="3d")
-                        trans = out["render_poses"][:, :3, -1].cpu()
-                        print(f"trans {trans.shape}")
-                        ax.plot(trans[:, 0], trans[:, 1], trans[:, 2])
-                        ax.view_init(elev=10.0, azim=45)
-
-                        # Turn off tick labels
-                        ax.set_yticklabels([])
-                        ax.set_xticklabels([])
-                        ax.set_zticklabels([])
-
-                        plt.savefig(f"{run_dir}/trajectory.png")
-                        plt.close(fig)
-                        image_dict["result/trajectory"] = wandb.Image(
-                            plt.imread(f"{run_dir}/trajectory.png")
-                        )
-
-                        # concat all frames along width into one image
-                        for f in range(len(frames)):
-                            frames[f] = torch.from_numpy(frames[f])
-                            depth_frames[f] = torch.from_numpy(depth_frames[f])
-                        print(len(frames))
-
-                        target_depth = depth_frames[-1]
-                        frames = frames[1:][::4][2:-1]
-                        depth_frames = depth_frames[1:][::4][2:-1]
-
-                        frames_cat = torch.cat(frames, dim=1)
-                        depth_frames_cat = torch.cat(depth_frames, dim=1)
-
-                        image_dict["result/concat_video"] = wandb.Image(
-                            make_grid(frames_cat).numpy()
-                        )
-                        image_dict["result/concat_video_depth"] = wandb.Image(
-                            make_grid(depth_frames_cat).numpy()
-                        )
-                        image_dict["result/target_depth"] = wandb.Image(
-                            make_grid(target_depth).numpy()
-                        )
-
-                        wandb.log(image_dict)
-    elif sampling_type == "autoregressive":
-        ###### use generated images autoregressively to sample ######
-        for video_data in re_indices.interesting_indices:
-            video_idx = video_data[0]
-            flip = video_data[1]
-
-            sampled_frame = None
-            prev_trgt_c2w = None
-            step = 150
-            nsamples = 2
-            ntimesteps = 3
-            with torch.no_grad():
-                for _ in range(nsamples):
-                    for i in range(ntimesteps):
-                        if flip == "flip":
-                            start_idx = (ntimesteps - i - 1) * step
-                            end_idx = ntimesteps * step - 1
-                            trgt_idx = [start_idx]
-                            ctxt_idx = [end_idx]
-                        else:
-                            start_idx = 0
-                            end_idx = (i + 1) * step - 1
-                            trgt_idx = [end_idx]
-                            ctxt_idx = [start_idx]
-
-                        ctxt_idx_np = np.array(ctxt_idx, dtype=np.int64)
-                        trgt_idx_np = np.array(trgt_idx, dtype=np.int64)
-
-                        print(f"Starting rendering step {ctxt_idx_np}, {trgt_idx_np}")
-                        if i == 0:
-                            data = dataset.data_for_video(
-                                video_idx=video_idx,
-                                ctxt_idx=ctxt_idx_np,
-                                trgt_idx=trgt_idx_np,
-                            )
-                            inp = to_gpu(data[0], "cuda")
-                            if not render_orig_traj:
-                                del inp["render_poses"]
-
-                            for k in inp.keys():
-                                inp[k] = inp[k].unsqueeze(0)
-
-                            if not use_dataset_pose:
-                                poses = trainer.model.model.compute_poses(
-                                    "spherical", inp, radius=0.0, n=90, max_angle=340
-                                )
-                                inp["render_poses"] = poses[: end_idx + 1]
-                                print(f"poses shape: {poses.shape}")
-                        else:
-                            # concatenate the sampled frame to the input ctxt_rgb
-                            inp["ctxt_rgb"] = torch.cat(
-                                (
-                                    inp["ctxt_rgb"],  # [:, -1:],
-                                    trainer.model.normalize(sampled_frame).unsqueeze(0),
-                                ),
-                                dim=1,
-                            )
-                            inp["ctxt_c2w"] = torch.cat(
-                                (inp["ctxt_c2w"], prev_trgt_c2w), dim=1
-                            )
-                            # hard code the target camera pose
-                            if use_dataset_pose:
-                                data = dataset.data_for_video(
-                                    video_idx=video_idx,
-                                    ctxt_idx=ctxt_idx_np,
-                                    trgt_idx=trgt_idx_np,
-                                )
-                                inp_temp = to_gpu(data[0], "cuda")
-                                inp["trgt_c2w"] = inp_temp["trgt_c2w"].unsqueeze(0)
-                                inp["render_poses"] = inp_temp[
-                                    "render_poses"
-                                ].unsqueeze(0)
-                            else:
-                                inp["trgt_c2w"] = (
-                                    poses[end_idx].unsqueeze(0).unsqueeze(0).cuda()
-                                )
-                                inp["render_poses"] = poses[: end_idx + 1, ...]
-
-                        num_context = inp["ctxt_rgb"].shape[1]
-                        print(f"num_context: {inp['ctxt_c2w'].shape[1]}")
-
-                        for j in range(1):
-                            print(f"Starting sample {j}")
-                            inp["render_top_down"] = False
-                            inp["num_frames_render"] = 30
+                    #if not render_orig_traj:
+                    #    del inp["render_poses"]
+                    #print(f"len of idx: {len(ctxt_idx)}")
+                    
+                    for j in range(1):  
+                        #(nsamples): # Red Herring BEWARE! These are number of literal diff environment samples from path.
+                        
+                        # print(f"Starting sample {j}. Make sure you have enough samples in path!")
+                        
+                        discovery = 0
+                        renders_per_frame = 1 # 50
+                        render_index = 0
+                        print("-----Initialisation complete, starting rendering-----")
+                        print(f"Will be rendering {renders_per_frame} hypotheses")
+                        
+                        while(render_index<renders_per_frame):
+                            
+                            print(f"Rendering hypothesis {render_index+1}")
+                            render_index+=1
+                            
+                            # Inefficient AF!
                             out = trainer.ema.ema_model.sample(batch_size=1, inp=inp)
-                            sampled_frame = out["images"]
-                            (
-                                frames,
+                            
+                            # Requires preprocessing
+                            
+                            (  
+                                rgbd_frames,
+                                rgb_frames,
                                 depth_frames,
                                 conditioning_depth_img,
                             ) = prepare_video_viz(out)
-
-                            # save to disk
-                            folder = os.path.join(run_dir, f"videos_{video_idx}_{_}")
-                            os.makedirs(
-                                folder, exist_ok=True,
-                            )
-                            print(f"saving, len(frames): {len(frames)}")
-                            for frame_idx, frame in enumerate(frames):
-                                Image.fromarray(frame).save(
-                                    os.path.join(folder, f"frame_{frame_idx:04d}.png",)
-                                )
-                            for frame_idx, frame in enumerate(depth_frames):
-                                Image.fromarray(frame).save(
-                                    os.path.join(
-                                        folder, f"frame_depth_{frame_idx:04d}.png",
-                                    )
-                                )
-
-                            denoised_f = os.path.join(
-                                run_dir, "denoised_view_circle.mp4"
-                            )
-                            imageio.mimwrite(denoised_f, frames, fps=10, quality=10)
-                            denoised_f_depth = os.path.join(
-                                run_dir, "denoised_view_circle_depth.mp4"
-                            )
-                            imageio.mimwrite(
-                                denoised_f_depth, depth_frames, fps=10, quality=10
-                            )
-                            wandb.log(
-                                {
-                                    "vid/interp": wandb.Video(
-                                        denoised_f,
-                                        format="mp4",
-                                        fps=10,
-                                        caption=f"video {i}",
-                                    ),
-                                    "vid/interp_depth": wandb.Video(
-                                        denoised_f_depth, format="mp4", fps=10
-                                    ),
-                                }
-                            )
-                            ctxt_img = (
-                                trainer.model.unnormalize(inp["ctxt_rgb"][:, 0])
-                                .cpu()
-                                .detach()
-                            )
-                            ctxt_img = torch.clip(ctxt_img, 0, 1)
-                            trgt_img = (
-                                trainer.model.unnormalize(inp["trgt_rgb"][:, 0])
-                                .cpu()
-                                .detach()
-                            )
-                            trgt_img = torch.clip(trgt_img, 0, 1)
-                            print(
-                                f"trgt img shape: {trgt_img.shape}, cond depth: {conditioning_depth_img.shape}"
-                            )
-                            image_dict = {
-                                "result/trgt_rgb": wandb.Image(
-                                    make_grid(trgt_img).permute(1, 2, 0).numpy()
-                                ),
-                                "result/ctxt_rgb": wandb.Image(
-                                    make_grid(ctxt_img).permute(1, 2, 0).numpy()
-                                ),
-                                "result/input_render": wandb.Image(
-                                    make_grid(out["rgb"].cpu().detach())
-                                    .permute(1, 2, 0)
-                                    .numpy()
-                                ),
-                                "result/output": wandb.Image(
-                                    make_grid(
-                                        trainer.model.normalize(out["images"])
-                                        .cpu()
-                                        .detach()
-                                    )
-                                    .permute(1, 2, 0)
-                                    .numpy()
-                                ),
-                                "result/input_depth": wandb.Image(
-                                    make_grid(conditioning_depth_img)
-                                    .permute(1, 2, 0)
-                                    .numpy()
-                                ),
-                            }
-
-                            fig = plt.figure()
-                            ax = fig.add_subplot(111, projection="3d")
-                            trans = out["render_poses"][:, :3, -1].cpu()
-                            print(f"trans {trans.shape}")
-                            ax.plot(trans[:, 0], trans[:, 1], trans[:, 2])
-                            ax.view_init(elev=10.0, azim=45)
-
-                            # Turn off tick labels
-                            ax.set_yticklabels([])
-                            ax.set_xticklabels([])
-                            ax.set_zticklabels([])
-
-                            plt.savefig(f"{run_dir}/trajectory.png")
-                            plt.close(fig)
-                            image_dict["result/trajectory"] = wandb.Image(
-                                plt.imread(f"{run_dir}/trajectory.png")
-                            )
-
-                            # concat all frames along width into one image
-                            for f in range(len(frames)):
-                                frames[f] = torch.from_numpy(frames[f])
-                                depth_frames[f] = torch.from_numpy(depth_frames[f])
-                            print(len(frames))
-                            frames = frames[3:][::4]
-                            depth_frames = depth_frames[3:][::4]
-
-                            frames_cat = torch.cat(frames, dim=1)
-                            depth_frames_cat = torch.cat(depth_frames, dim=1)
-                            # add to image dict
-                            image_dict["result/concat_video"] = wandb.Image(
-                                make_grid(frames_cat).numpy()
-                            )
-                            image_dict["result/concat_video_depth"] = wandb.Image(
-                                make_grid(depth_frames_cat).numpy()
-                            )
-                            wandb.log(image_dict)
-                        # ctxt_idx = ctxt_idx + [end_idx]
-                        prev_trgt_c2w = inp["trgt_c2w"]
-
-
-
-def prepare_video_viz(out):
-    frames = out["videos"]
-    for f in range(len(frames)):
-        frames[f] = rearrange(frames[f], "b h w c -> h (b w) c")
-
-    depth_frames = out["depth_videos"]
-    for f in range(len(depth_frames)):
-        depth_frames[f] = rearrange(depth_frames[f], "(n b) h w -> n h (b w)", n=1)
-
-    conditioning_depth = out["conditioning_depth"].cpu()
-    # resize to depth_frames
-    conditioning_depth = F.interpolate(
-        conditioning_depth[:, None],
-        size=depth_frames[0].shape[-2:],
-        mode="bilinear",
-        antialias=True,
-    )[:, 0]
-    depth_frames.append(conditioning_depth)
-
-    depth = torch.cat(depth_frames, dim=0)
-    print(f"depth shape: {depth.shape}")
-
-    depth = (
-        torch.from_numpy(
-            jet_depth(depth[:].cpu().detach().view(depth.shape[0], depth.shape[-1], -1))
-        )
-        * 255
-    )
-    # convert depth to list of images
-    depth_frames = []
-    for i in range(depth.shape[0]):
-        depth_frames.append(depth[i].cpu().detach().numpy().astype(np.uint8))
-    return (
-        frames,
-        depth_frames[:-1],
-        rearrange(torch.from_numpy(depth_frames[-1]), "h w c -> () c h w"),
-    )
-
+                            
+                            # Save to file: Intermediate Processing followed by saving to respective directories to facilitate further post processing
+                            
+                            asset_saver(rgb_frames, depth_frames, conditioning_depth_img, inp, out, trainer, "/home/projects/Rudra_Generative_Robotics/EK/DFM/results")
+                            mover(render_index)
+                            save_rgbd(rgbd_frames, render_index)
+                            
+                            # Visualizer
+                            
+                            # json_file = '/home/projects/Rudra_Generative_Robotics/EK/DFM/camera_poses/strafe_right.json'
+                            
+                            # upscaler(method='Wave')
+                            # upscaler(method='GAN')
+                            
+                            
+                            # Call the object detector
+                            
+                            # object_info = detector('sink')
+                            
+                            # if object_info != None:
+                            #     print("Object Found in Hallucination!")
+                            #     rgbd_file = save_rgbd(rgbd_frames, save_dir = './RGBD/{timestamp}/')
+                            #     observer(rgbd_file, object_info)
+                            #     discovery+=1
+                            #     all_times += count
+                        
+                        print(f"Rendering of {renders_per_frame} hypothesis worlds completed!")
+                        # print(f"Object discovered {discovery} renders for a total of {all_times}.")
+                        print("-------System Exiting-------")
+                        
+                        exit(0)
+                    
+                        
+        
+        
+    else:
+        print("Other things are stuff of dreams!")                   
+        # We do not care about the complete autoregressive method in this one---impossible to scale
+        
 if __name__ == "__main__":
     train()
+
+
+# Run code:
+# python experiment_scripts/re_results.py dataset=realestate batch_size=1 num_target=1 num_context=1 model_type=dit feats_cond=true sampling_type=simple max_scenes=10000 stage=test use_guidance=true guidance_scale=2.0 temperature=0.85 sampling_steps=50 name=re10k_inference image_size=128 checkpoint_path=files/re10k_model.pt wandb=local
