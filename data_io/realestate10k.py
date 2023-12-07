@@ -130,16 +130,15 @@ def strafe(pose_matrix, direction ='R', distance = 2):
     return updated_pose
 
 class Camera(object):
-    ca = 0 
-    dis = 0
-    num = 0
-    c2w_mat = np.eye(4)
-    c2w_mat[:3, 3] = [0, 0, 0]  # Translation vector
-    pose_list = []
+    # ca = 0 
+    # dis = 0
+    # num = 0
+    # c2w_mat = np.eye(4)
+    # c2w_mat[:3, 3] = [0, 0, 0]  # Translation vector
+    # pose_list = []
     
     def __init__(self, entry):
         fx, fy, cx, cy = entry[:4]
-        
         # fx = 123.48 /128
         # fy = 125.02 /128
         
@@ -152,16 +151,23 @@ class Camera(object):
         self.intrinsics = np.array(
             [[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32,
         )
-        Camera.ca+=75
-        Camera.dis+=2
-        Camera.num+=1
+        
+        # Camera.ca+=75
+        # Camera.dis+=2
+        # Camera.num+=1
         w2c_mat = np.array(entry[6:], dtype=np.float32).reshape(3, 4)
         w2c_mat_4x4 = np.eye(4, dtype=np.float32)
         w2c_mat_4x4[:3, :] = w2c_mat
         self.w2c_mat = w2c_mat_4x4 
         
         self.c2w_mat = np.linalg.inv(w2c_mat_4x4)
-        self.save_pose(self.c2w_mat, filename="./camera_poses/recorded_poses.json")
+        # print(self.c2w_mat)
+        # print(type(self.c2w_mat))
+        # Saving the poses in the data file
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.save_pose(self.c2w_mat, filename=f"./camera_poses/recorded_poses_{timestamp}.json")
+        # input("Pose")
+        
         #print("W2C", self.w2c_mat)
         #print("C2W", self.inv_mat)
         # Options to rotate, strafe, perturb the poses as they get generated
@@ -176,13 +182,40 @@ class Camera(object):
         # if Camera.num == 50:
         #     self.save_pose(Camera.pose_list)
         
+    # My method
+    # @staticmethod
+    # def save_pose(pose_list, filename="./camera_poses/strafe_right.json"):
+    #     os.makedirs(os.path.dirname(filename), exist_ok=True)
+    #     data = {str(i+1): pose for i, pose in enumerate(pose_list)}
+    #     with open(filename, 'w') as file:
+    #         json.dump(data, file, indent=4)
+            
+    #     print(f"Poses saved at {filename}")
+    
     @staticmethod
-    def save_pose(pose_list, filename="./camera_poses/strafe_right.json"):
+    def save_pose(pose, filename="./camera_poses/strafe_right.json"):
+        # Create directory if it doesn't exist
         os.makedirs(os.path.dirname(filename), exist_ok=True)
-        data = {str(i+1): pose for i, pose in enumerate(pose_list)}
+
+        # Initialize data dictionary
+        data = {}
+
+        # Try to load existing data if file exists
+        if os.path.exists(filename) and os.path.getsize(filename) > 0:
+            try:
+                with open(filename, 'r') as file:
+                    data = json.load(file)
+            except json.JSONDecodeError:
+                print(f"Warning: Existing file '{filename}' contains invalid JSON. It will be overwritten.")
+
+        # Add new pose to the data
+        new_index = str(len(data) + 1)
+        data[new_index] = pose.tolist() if isinstance(pose, np.ndarray) else pose
+
+        # Save updated data to JSON file
         with open(filename, 'w') as file:
             json.dump(data, file, indent=4)
-            
+
         print(f"Poses saved at {filename}")
         
 class RealEstate10kDatasetOM(Dataset):
